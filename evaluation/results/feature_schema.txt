@@ -1,0 +1,10 @@
+log_return_1d
+momentum_5
+momentum_10
+momentum_20
+rolling_vol_10
+rolling_vol_20
+rsi_14
+sma_20
+sma_50
+sma_20_over_50_ratio
