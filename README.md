@@ -16,8 +16,9 @@ analysis, and full experiment tracking via MLflow.
   Logistic Regression, Random Forest, XGBoost.
 - **Walk-forward validation** with `TimeSeriesSplit(n_splits=5)` — no information leakage
   from the future.
-- **Probability calibration** (isotonic) and **decision-threshold tuning** — boosts F1
-  by 25-62% over the default 0.5 threshold.
+- **Probability calibration** (isotonic) and **decision-threshold tuning** — boosts
+  calibrated F1 by ~39-57% over the default 0.5 threshold (threshold selected per fold
+  on an internal validation split, never the test set).
 - **Regime-stability analysis** across 5 manually defined market phases
   (pre-2020, bull 2020-21, bear 2022, recovery 2023, bull 2024+).
 - **Three-class classification** extension (strong-down / weak-neutral / strong-up).
@@ -33,7 +34,7 @@ analysis, and full experiment tracking via MLflow.
 | **RandomForest** | **0.50** | 0.41 | **0.55** | **0.72** |
 | XGBoost | 0.50 | 0.38 | 0.54 | 1.01 |
 
-After threshold tuning, F1 of all ML models jumps to **0.54-0.68**.
+After threshold tuning, calibrated F1 of the ML models reaches **0.61-0.63**.
 
 ## Project structure
 
@@ -164,9 +165,11 @@ for substantially better log-loss — typically 24-38% reduction across models.
 
 ### Decision-threshold tuning
 
-The default 0.5 threshold is rarely optimal in finance. We sweep thresholds
-in `[0.30, 0.70]` on validation data and pick the one that maximises F1.
-This single step improves F1 by **25-62%** across all three ML models.
+The default 0.5 threshold is rarely optimal in finance. Inside each walk-forward
+fold we sweep thresholds in `[0.30, 0.70]` on an internal validation split carved
+from the last 20% of that fold's training window — never the test set — and pick
+the one that maximises F1. This step improves calibrated F1 by **~39-57%** across
+the three ML models.
 
 ### Regime-stability analysis
 

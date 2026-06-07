@@ -11,14 +11,19 @@ walk_forward_evaluate (see evaluation/walk_forward.py):
        approximates monotonic-but-flexible mapping from raw probabilities
        to actual frequencies of the positive class.
 
-    2. Decision-threshold tuning. The default 0.5 threshold is rarely
-       optimal in finance — Jansen (Ch. 6) recommends treating it as a
-       hyperparameter optimised on validation data. We sweep thresholds in
-       [0.30, 0.70] in steps of 0.01 and pick the one maximising F1 on
-       each fold's validation half.
+    2. Decision-threshold tuning WITHOUT test-set leakage. Inside every
+       walk-forward fold we carve an internal validation slice from the last
+       INNER_VAL_FRACTION (20%) of that fold's TRAINING window, fit a separate
+       model on the remaining 80%, and pick the threshold in [0.30, 0.70]
+       (step 0.01) that maximises F1 on that internal validation slice only.
+       The selected threshold is then applied to the fold's TEST predictions.
+       Per-fold test predictions are aggregated before scoring; the test set
+       is NEVER used to choose the threshold. The `threshold` column in the
+       summary holds the mean of the five per-fold thresholds.
 
 Output:
     evaluation/results/calibration_summary.csv   — before/after metrics per model
+    evaluation/results/calibration_thresholds_per_fold.csv — per-fold thresholds (raw & cal)
     evaluation/figures/figure_calibration_curves.png   — reliability diagrams
     evaluation/figures/figure_threshold_tuning.png     — F1 vs threshold curves
 
@@ -59,6 +64,7 @@ FEATURE_COLUMNS = [
 
 N_SPLITS = 5
 THRESHOLDS = np.linspace(0.30, 0.70, 41)  # step 0.01
+INNER_VAL_FRACTION = 0.2  # last 20% of each fold's TRAIN window = internal validation
 
 # Models to calibrate. Persistence baselines are skipped — they return
 # degenerate pseudo-probabilities and calibration would be meaningless.
@@ -75,43 +81,82 @@ def _calibrated_walk_forward(
     X: pd.DataFrame,
     y: pd.Series,
     n_splits: int = N_SPLITS,
+    inner_val_fraction: float = INNER_VAL_FRACTION,
 ):
     """
-    Run walk-forward evaluation with isotonic calibration applied INSIDE
-    each fold. Returns three concatenated arrays:
-        y_true_all      ground truth, in chronological order
-        proba_raw_all   probabilities from the un-calibrated base estimator
-        proba_cal_all   probabilities from the isotonic-calibrated wrapper
+    Walk-forward with isotonic calibration applied INSIDE each fold, plus
+    per-fold decision-threshold selection that NEVER touches the test set.
+
+    Per fold:
+      1. Fit raw and isotonic-calibrated models on the FULL training window and
+         score the test set -> proba_raw / proba_cal (the out-of-fold
+         probabilities used everywhere downstream; unchanged from before).
+      2. Carve an internal validation slice = last `inner_val_fraction` of the
+         TRAIN rows (chronological). Fit a SEPARATE model on the earlier part,
+         score the validation slice, and pick the F1-optimal threshold there.
+      3. Apply that fold's validation threshold to this fold's TEST scores.
+
+    Returns a dict of chronologically-concatenated TEST arrays plus the list of
+    per-fold thresholds (raw and calibrated):
+        y_true, proba_raw, proba_cal, y_pred_raw_tuned, y_pred_cal_tuned,
+        thr_raw_per_fold, thr_cal_per_fold.
     """
     splitter = TimeSeriesSplit(n_splits=n_splits)
 
     y_true_parts, proba_raw_parts, proba_cal_parts = [], [], []
+    pred_raw_tuned_parts, pred_cal_tuned_parts = [], []
+    thr_raw_per_fold, thr_cal_per_fold = [], []
 
     for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
         X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
 
-        # Raw model
+        # (1) Models trained on the FULL training window -> test scores.
+        # IMPORTANT: pass a fresh clone to the calibrator, otherwise
+        # CalibratedClassifierCV refits state of an already-fitted pipeline.
         raw_model = base_factory()
         raw_model.fit(X_tr, y_tr)
         proba_raw = raw_model.predict_proba(X_te)[:, 1]
 
-        # Calibrated model — IMPORTANT: pass a fresh clone, otherwise
-        # CalibratedClassifierCV refits state of an already-fitted pipeline.
         cal_base = base_factory()
         cal_model = CalibratedClassifierCV(cal_base, method="isotonic", cv=3)
         cal_model.fit(X_tr, y_tr)
         proba_cal = cal_model.predict_proba(X_te)[:, 1]
 
+        # (2) Internal validation = last fraction of TRAIN only (chronological).
+        # Earliest rows train the threshold-selection model, latest rows are the
+        # held-out validation slice on which the threshold is chosen.
+        n_tr = len(X_tr)
+        cut = int(round(n_tr * (1.0 - inner_val_fraction)))
+        X_in_tr, X_in_val = X_tr.iloc[:cut], X_tr.iloc[cut:]
+        y_in_tr, y_in_val = y_tr.iloc[:cut], y_tr.iloc[cut:]
+
+        thr_raw = _tune_threshold_on_validation(
+            base_factory, X_in_tr, y_in_tr, X_in_val, y_in_val, calibrated=False
+        )
+        thr_cal = _tune_threshold_on_validation(
+            base_factory, X_in_tr, y_in_tr, X_in_val, y_in_val, calibrated=True
+        )
+
+        # (3) Apply the validation-selected thresholds to this fold's TEST scores.
+        pred_raw_tuned_parts.append((proba_raw > thr_raw).astype(int))
+        pred_cal_tuned_parts.append((proba_cal > thr_cal).astype(int))
+        thr_raw_per_fold.append(thr_raw)
+        thr_cal_per_fold.append(thr_cal)
+
         y_true_parts.append(y_te.values)
         proba_raw_parts.append(proba_raw)
         proba_cal_parts.append(proba_cal)
 
-    return (
-        np.concatenate(y_true_parts),
-        np.concatenate(proba_raw_parts),
-        np.concatenate(proba_cal_parts),
-    )
+    return {
+        "y_true": np.concatenate(y_true_parts),
+        "proba_raw": np.concatenate(proba_raw_parts),
+        "proba_cal": np.concatenate(proba_cal_parts),
+        "y_pred_raw_tuned": np.concatenate(pred_raw_tuned_parts),
+        "y_pred_cal_tuned": np.concatenate(pred_cal_tuned_parts),
+        "thr_raw_per_fold": thr_raw_per_fold,
+        "thr_cal_per_fold": thr_cal_per_fold,
+    }
 
 
 def _tune_threshold(y_true: np.ndarray, y_proba: np.ndarray) -> tuple[float, float]:
@@ -130,6 +175,46 @@ def _safe_metrics(y_true, y_proba, threshold) -> dict:
     proba_clipped = np.clip(y_proba, 1e-7, 1 - 1e-7)
     return {
         "threshold": threshold,
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "roc_auc": roc_auc_score(y_true, y_proba),
+        "log_loss": log_loss(y_true, proba_clipped, labels=[0, 1]),
+    }
+
+
+def _tune_threshold_on_validation(
+    base_factory, X_in_tr, y_in_tr, X_in_val, y_in_val, calibrated: bool,
+) -> float:
+    """
+    Select a threshold WITHOUT seeing the test set: fit a model on the
+    inner-training rows only, score the inner-validation rows, and return the
+    F1-optimal threshold in THRESHOLDS. For the calibrated variant the same
+    isotonic wrapper as the main pipeline is used, so the threshold is chosen
+    on calibrated scores. Falls back to 0.5 when the validation slice is too
+    small or single-class (an F1-optimal threshold would be meaningless).
+    """
+    y_val = np.asarray(y_in_val)
+    if len(y_val) < 10 or len(np.unique(y_val)) < 2:
+        return 0.5
+    model = base_factory()
+    if calibrated:
+        model = CalibratedClassifierCV(model, method="isotonic", cv=3)
+    model.fit(X_in_tr, y_in_tr)
+    proba_val = model.predict_proba(X_in_val)[:, 1]
+    thr, _ = _tune_threshold(y_val, proba_val)
+    return thr
+
+
+def _tuned_metrics(y_true, y_proba, y_pred, reported_threshold) -> dict:
+    """
+    Headline metrics for a tuned variant. `y_pred` was produced per fold using
+    each fold's validation-selected threshold; `reported_threshold` is the mean
+    of those per-fold thresholds, stored for the summary only. ROC-AUC and
+    log-loss are threshold-independent, hence identical to the default variant.
+    Keys match _safe_metrics so the CSV schema is unchanged.
+    """
+    proba_clipped = np.clip(y_proba, 1e-7, 1 - 1e-7)
+    return {
+        "threshold": reported_threshold,
         "f1": f1_score(y_true, y_pred, zero_division=0),
         "roc_auc": roc_auc_score(y_true, y_proba),
         "log_loss": log_loss(y_true, proba_clipped, labels=[0, 1]),
@@ -159,17 +244,24 @@ def main() -> None:
         print(f"Calibration + threshold tuning: {name}")
         print("=" * 72)
 
-        y_true, proba_raw, proba_cal = _calibrated_walk_forward(factory, X, y)
+        wf = _calibrated_walk_forward(factory, X, y)
+        y_true = wf["y_true"]
+        proba_raw = wf["proba_raw"]
+        proba_cal = wf["proba_cal"]
 
-        # Default threshold (0.5)
+        # Default threshold (0.5) — unchanged baseline.
         m_raw_default = _safe_metrics(y_true, proba_raw, threshold=0.5)
         m_cal_default = _safe_metrics(y_true, proba_cal, threshold=0.5)
 
-        # Tuned threshold (per probability source)
-        thr_raw, _ = _tune_threshold(y_true, proba_raw)
-        thr_cal, _ = _tune_threshold(y_true, proba_cal)
-        m_raw_tuned = _safe_metrics(y_true, proba_raw, threshold=thr_raw)
-        m_cal_tuned = _safe_metrics(y_true, proba_cal, threshold=thr_cal)
+        # Tuned: thresholds were chosen per fold on that fold's internal
+        # validation slice (never the test set) and already applied to the
+        # fold's test predictions inside _calibrated_walk_forward. We report the
+        # mean per-fold threshold; F1 is computed on the aggregated test
+        # predictions. ROC-AUC / log-loss are threshold-free -> equal default.
+        thr_raw = round(float(np.mean(wf["thr_raw_per_fold"])), 3)
+        thr_cal = round(float(np.mean(wf["thr_cal_per_fold"])), 3)
+        m_raw_tuned = _tuned_metrics(y_true, proba_raw, wf["y_pred_raw_tuned"], thr_raw)
+        m_cal_tuned = _tuned_metrics(y_true, proba_cal, wf["y_pred_cal_tuned"], thr_cal)
 
         # Console output
         print(f"  RAW (uncalibrated):")
@@ -186,6 +278,11 @@ def main() -> None:
         print(f"    tuned   thr={thr_cal:.2f}  F1={m_cal_tuned['f1']:.4f}  "
               f"AUC={m_cal_tuned['roc_auc']:.4f}  "
               f"logloss={m_cal_tuned['log_loss']:.4f}")
+        print(
+            f"    per-fold thresholds  "
+            f"raw={[round(t, 3) for t in wf['thr_raw_per_fold']]}  "
+            f"cal={[round(t, 3) for t in wf['thr_cal_per_fold']]}"
+        )
 
         for label, m in (
             ("raw_default", m_raw_default),
@@ -201,6 +298,8 @@ def main() -> None:
             "proba_cal": proba_cal,
             "thr_raw": thr_raw,
             "thr_cal": thr_cal,
+            "thr_raw_per_fold": wf["thr_raw_per_fold"],
+            "thr_cal_per_fold": wf["thr_cal_per_fold"],
         }
 
     # -------------------------------------------------------------------------
@@ -210,6 +309,22 @@ def main() -> None:
     summary_df.to_csv(summary_path, index=False)
     print(f"\nsaved -> {summary_path}")
     print(summary_df.round(4).to_string(index=False))
+
+    # -------------------------------------------------------------------------
+    # Per-fold thresholds (transparency). Each threshold was selected on that
+    # fold's internal validation split, never the test set. One row per
+    # (model, source, fold); does not alter the calibration_summary schema.
+    per_fold_rows: list[dict] = []
+    for name, d in calibration_data.items():
+        for fold_i, t in enumerate(d["thr_raw_per_fold"], start=1):
+            per_fold_rows.append({"model": name, "source": "raw",
+                                  "fold": fold_i, "threshold": round(float(t), 2)})
+        for fold_i, t in enumerate(d["thr_cal_per_fold"], start=1):
+            per_fold_rows.append({"model": name, "source": "cal",
+                                  "fold": fold_i, "threshold": round(float(t), 2)})
+    per_fold_path = RESULTS_DIR / "calibration_thresholds_per_fold.csv"
+    pd.DataFrame(per_fold_rows).to_csv(per_fold_path, index=False)
+    print(f"saved -> {per_fold_path}")
 
     # -------------------------------------------------------------------------
     # Figure: reliability diagrams (calibration curves) before/after
@@ -261,7 +376,11 @@ def main() -> None:
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
     axes[0].set_ylabel("F1")
-    fig.suptitle("F1 vs decision threshold (out-of-fold predictions)", y=1.02)
+    fig.suptitle(
+        "F1 vs decision threshold on out-of-fold TEST predictions (diagnostic);\n"
+        "dotted lines = mean per-fold threshold selected on internal validation",
+        y=1.04,
+    )
     fig.tight_layout()
     fig.savefig(FIGURES_DIR / "figure_threshold_tuning.png",
                 dpi=150, bbox_inches="tight")
