@@ -1,210 +1,108 @@
-# BTC ML Pipeline — directional prediction with walk-forward validation
+# Can classical ML time Bitcoin? An honest walk-forward study
 
-> Engineering thesis project, PJATK Warsaw, 2026.
-> Topic: *Application of machine learning methods for forecasting market signals on BTC data.*
-> Author: Mateusz Jastrzębski (s27397). Supervisor: dr Adam Szmigielski.
+[![tests](https://github.com/MateuszJastrzebski21/btc-ml-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/MateuszJastrzebski21/btc-ml-pipeline/actions/workflows/tests.yml)
 
-End-to-end machine-learning pipeline for predicting the direction of 5-day-ahead returns
-of BTC/USDT, with rigorous time-series validation, probability calibration, regime-stability
-analysis, and full experiment tracking via MLflow.
+Predicting the direction of the 5-day BTC/USDT return from daily OHLCV data with
+logistic regression, random forest and XGBoost, evaluated out-of-sample with
+walk-forward validation, then stress-tested the way a sceptical reviewer would.
 
----
+Engineering thesis, PJATK Warsaw, 2026 (supervisor: dr inż. Adam Szmigielski).
+Full text (Polish): [`docs/thesis_PL.pdf`](docs/thesis_PL.pdf).
 
-## Highlights
+## TL;DR
 
-- **5 models** compared head-to-head: two naive persistence baselines (1-day and 5-day),
-  Logistic Regression, Random Forest, XGBoost.
-- **Walk-forward validation** with `TimeSeriesSplit(n_splits=5)` — no information leakage
-  from the future.
-- **Probability calibration** (isotonic) and **decision-threshold tuning** — boosts
-  calibrated F1 by ~39-57% over the default 0.5 threshold (threshold selected per fold
-  on an internal validation split, never the test set).
-- **Regime-stability analysis** across 5 manually defined market phases
-  (pre-2020, bull 2020-21, bear 2022, recovery 2023, bull 2024+).
-- **Three-class classification** extension (strong-down / weak-neutral / strong-up).
-- **MLflow tracking** with parent-child run hierarchy: ~70 runs across 3 experiments.
+- **The signal is weak but real for the tree models:** mean out-of-sample ROC-AUC is
+  0.54 to 0.55. Its 95% block-bootstrap CI excludes 0.5 for RF/XGBoost and not for
+  logistic regression.
+- **It is not tradeable:** a long/flat strategy on the signal earns a Sharpe of 0.24 to 0.33
+  after 10 bps costs, against 0.61 for buy-and-hold over the same 6 years.
+- **Validation discipline mattered more than model choice:** hyperparameter tuning moved AUC by
+  under 1 pp. Removing non-stationary features or getting the P&L accounting wrong moved the
+  conclusions more than switching from logistic regression to XGBoost did.
+- **Fully reproducible:** a frozen data window (2019-01-01 to 2026-04-25, 2,672 daily bars)
+  reproduces every number in the thesis exactly. Look-ahead tests run in CI.
 
-## Headline results
+## Setup
 
-| Model | Accuracy | F1 | ROC-AUC | Log-loss |
-| --- | --- | --- | --- | --- |
-| Persistence1d (naive) | 0.47 | 0.49 | 0.47 | 2.42 |
-| Persistence5d (naive) | 0.48 | 0.51 | 0.48 | 2.38 |
-| LogReg | 0.49 | 0.34 | 0.53 | 1.27 |
-| **RandomForest** | **0.50** | 0.41 | **0.55** | **0.72** |
-| XGBoost | 0.50 | 0.38 | 0.54 | 1.01 |
+| | |
+|---|---|
+| Data | Binance BTC/USDT daily bars, 2019-01-01 to 2026-04-25 (2,618 labelled rows, 54.1% up) |
+| Target | `y_t = 1[close_{t+5} > close_t]` |
+| Features | log return, momentum (5/10/20), realised vol (10/20), RSI-14, SMA-20/50 and their ratio |
+| Validation | expanding-window walk-forward, 5 folds, 436 test days each (May 2020 to Apr 2026) |
+| Models | persistence (1d, 5d), logistic regression, random forest, XGBoost; 21-config grid search |
+| Extras | isotonic calibration, nested threshold selection, cost-aware backtest, per-regime breakdown, 3-class variant, MLflow tracking (~70 runs) |
 
-After threshold tuning, calibrated F1 of the ML models reaches **0.61-0.63**.
+## Results (thesis)
 
-## Project structure
+Mean over 5 walk-forward folds, threshold 0.5:
 
-```
-btc-ml-pipeline/
-├── data/
-│   ├── fetch_binance.py           # OHLCV downloader (Binance public API)
-│   ├── raw/                       # downloaded parquet files
-│   └── processed/                 # engineered features + target
-├── features/
-│   ├── engineer.py                # binary target + 10 features (returns, momentum, vol, RSI, SMA)
-│   └── engineer_3class.py         # three-class target generator
-├── models/
-│   ├── baseline.py                # Logistic Regression with StandardScaler in Pipeline
-│   ├── random_forest.py           # Random Forest classifier (regularised)
-│   ├── xgboost_model.py           # XGBoost classifier
-│   └── persistence.py             # naive baselines (1d and 5d)
-├── evaluation/
-│   ├── walk_forward.py            # TimeSeriesSplit walk-forward evaluator
-│   ├── calibration.py             # isotonic calibration + threshold tuning
-│   ├── trading_metrics.py         # equity curve with transaction costs
-│   ├── regime_analysis.py         # per-regime stability analysis
-│   ├── plots.py                   # comparison figures
-│   ├── results/                   # CSV + parquet outputs (.gitignore? see below)
-│   └── figures/                   # PNG outputs
-├── scripts/
-│   ├── run_all_models.py          # offline runner without MLflow
-│   ├── run_with_mlflow.py         # main pipeline with MLflow logging
-│   ├── run_tuning.py              # 21-config hyperparameter grid
-│   └── run_3class.py              # multi-class classification experiment
-├── notebooks/
-│   ├── 01_data_exploration.ipynb  # EDA: distributions, target shift, regimes
-│   └── 02_model_comparison.ipynb  # consolidated dashboard of all results
-├── configs/                       # (placeholder for future YAML configs)
-├── mlruns/                        # MLflow file store (auto-created, gitignored)
-├── requirements.txt
-└── README.md
-```
+| Model | Accuracy | ROC-AUC | Log-loss |
+|---|---|---|---|
+| Persistence 1d | 0.473 | 0.471 | 2.43 |
+| Persistence 5d | 0.485 | 0.479 | 2.38 |
+| Logistic regression | 0.485 | 0.528 | 1.26 |
+| Random forest | **0.500** | **0.543** | **0.72** |
+| XGBoost | 0.499 | 0.539 | 1.00 |
 
-## How to run from scratch
+Performance depends heavily on the regime. XGBoost reaches an AUC of 0.59 in the 2022 bear market
+but performs at chance (0.48 to 0.50) in the 2020–21 bull run
+([`regime_metrics.csv`](evaluation/results/regime_metrics.csv)).
 
-```powershell
-# 1. Create a virtual environment
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+![equity curves](evaluation/figures/figure_equity_curves.png)
 
-# 2. Install dependencies
+## Post-thesis audit
+
+After submitting the thesis I re-checked it against the objections a quant reviewer would raise
+([`scripts/run_audit.py`](scripts/run_audit.py), outputs in [`evaluation/audit/`](evaluation/audit/)).
+The thesis code was not changed, so its numbers still reproduce.
+
+| Question | Finding |
+|---|---|
+| Does it beat *always predict up*? | **No, on accuracy and F1.** Always-up scores accuracy 0.536 and F1 0.70, beating every model on both, including the tuned F1 of 0.61–0.63 reported in the thesis. That F1 gain from threshold tuning mostly came from predicting "up" more often. Only ranking metrics (AUC) show skill. |
+| Do the 5-day labels leak across the fold boundary? | **Negligibly.** Purging 5 rows (`TimeSeriesSplit(gap=5)`) moves AUC by less than 0.01. |
+| Are raw price levels (`sma_20`, `sma_50`) a problem? | **Yes.** Without them, mean per-fold AUC drops to 0.51–0.53, while pooled AUC rises from ~0.50 to ~0.53. The level features shift the score scale from fold to fold. |
+| Is AUC > 0.5 significant? | **Marginal.** 20-day moving-block bootstrap: RF 0.546 [0.511, 0.592], XGB 0.546 [0.512, 0.587], LogReg 0.529 [0.485, 0.563]. These p-values are not corrected for the 21-config search. |
+| Is the backtest right? | **It was too generous.** The thesis spread each 5-day forward return over 5 days, used `sqrt(252)` for a 24/7 asset and applied the mean threshold across folds. With next-day returns, per-fold thresholds and `sqrt(365)`, Sharpe is 0.24–0.33 vs 0.61 for buy-and-hold. The strategy is long 73–78% of the time, so it behaves like noisy, partially de-levered buy-and-hold with the same ~75% drawdown. |
+
+![audit](evaluation/figures/figure_audit_auc_ci.png)
+
+**Takeaway:** the honest verdict is "a small, regime-dependent ranking edge that does not survive
+contact with costs and a buy-and-hold benchmark". Next steps I would take: purged/embargoed CV with
+combinatorial paths (CPCV), deflated Sharpe for the model search, cross-sectional rather than
+single-asset framing, and volatility-scaled position sizing instead of a binary threshold.
+
+## Reproduce
+
+```bash
 pip install -r requirements.txt
-
-# 3. Download data (~10 seconds)
-python data/fetch_binance.py
-
-# 4. Engineer binary features and target
+python data/fetch_binance.py          # frozen window, ~10 s
 python -m features.engineer
-
-# 5. Run the main pipeline (5 models, walk-forward, MLflow tracking)
-python -m scripts.run_with_mlflow
-
-# 6. Hyperparameter tuning — 21 configurations
-python -m scripts.run_tuning
-
-# 7. Calibration + threshold tuning + equity curves
-python -m evaluation.calibration
+python -m scripts.run_with_mlflow     # 5 models, walk-forward, MLflow (or scripts.run_all_models)
+python -m scripts.run_tuning          # 21-config grid
+python -m evaluation.calibration      # isotonic + nested threshold selection
 python -m evaluation.trading_metrics
-
-# 8. Per-regime stability analysis
 python -m evaluation.regime_analysis
-
-# 9. Three-class extension
-python -m features.engineer_3class
-python -m scripts.run_3class
-
-# 10. Generate comparison figures
-python -m evaluation.plots
+python -m scripts.run_audit           # post-thesis audit
+pytest -q                             # look-ahead / correctness tests
 ```
 
-Total runtime on a modern laptop: ~10-15 minutes including all tuning runs.
+## Layout
 
-## Inspect results
-
-### MLflow UI
-
-```powershell
-mlflow ui --backend-store-uri "file:///$(Resolve-Path mlruns)"
 ```
-
-Then open `http://127.0.0.1:5000` and pick one of the three experiments:
-- `btc_ml_pipeline` — main run with all 5 models, 31 runs
-- `btc_ml_tuning` — hyperparameter grid, 21 runs
-- `btc_ml_pipeline_3class` — multi-class extension, ~18 runs
-
-### Notebooks
-
-```powershell
-jupyter notebook notebooks/02_model_comparison.ipynb
+data/fetch_binance.py       Binance downloader (frozen date range)
+features/                   features + binary / 3-class targets
+models/                     persistence baselines, LogReg pipeline, RF, XGBoost
+evaluation/                 walk-forward, calibration, backtest, regimes, plots
+evaluation/results|figures  thesis artefacts (CSV, parquet, PNG)
+evaluation/audit/           post-thesis audit outputs
+scripts/                    runners (MLflow, tuning, 3-class, audit)
+tests/                      look-ahead tests on synthetic data (run in CI)
+docs/thesis_PL.pdf          thesis
 ```
-
-`02_model_comparison.ipynb` consolidates every result table and figure produced
-by the pipeline into a single readable narrative — designed as a "demo dashboard"
-for thesis defence.
-
-### Raw artefacts
-
-- `evaluation/results/` — CSVs (per-fold metrics, calibration summary,
-  regime metrics, trading metrics, 3-class summary, tuning summary)
-- `evaluation/figures/` — PNG figures (model comparison, calibration curves,
-  threshold tuning, equity curves, regime metrics, confusion matrices,
-  probability distributions)
-
-## Methodology highlights
-
-### Walk-forward validation
-
-Standard random K-fold leaks future information into training. We use
-`TimeSeriesSplit(n_splits=5)` which expands the training window
-chronologically: each fold's test set is strictly newer than its training set.
-Preprocessing (scaling) is wrapped in an sklearn `Pipeline` so that
-`StandardScaler.fit()` runs only on the training half of each fold. Reference:
-Jansen (2020), *Machine Learning for Algorithmic Trading*, Ch. 6, pp. 168-170.
-
-### Probability calibration
-
-Tree-ensemble models in particular tend to return uncalibrated probabilities
-that concentrate near 0 and 1 (visible in the probability distribution figure).
-We apply isotonic calibration via `sklearn.calibration.CalibratedClassifierCV`
-inside each walk-forward fold. This trades a small amount of global ROC-AUC
-for substantially better log-loss — typically 24-38% reduction across models.
-
-### Decision-threshold tuning
-
-The default 0.5 threshold is rarely optimal in finance. Inside each walk-forward
-fold we sweep thresholds in `[0.30, 0.70]` on an internal validation split carved
-from the last 20% of that fold's training window — never the test set — and pick
-the one that maximises F1. This step improves calibrated F1 by **~39-57%** across
-the three ML models.
-
-### Regime-stability analysis
-
-We split the test predictions into five manually defined regimes based on
-known BTC market phases and recompute all metrics within each. Shows that
-model performance is **strongly regime-dependent** — a known challenge with
-non-stationary financial time series (López de Prado 2018, Ch. 7).
-
-## What's intentionally out of scope
-
-This is a focused engineering thesis, not an exhaustive research paper.
-The following are deliberately not included:
-
-- Deep learning (LSTM, Transformer architectures)
-- Sentiment / on-chain alternative data
-- Portfolio context, position sizing, risk management
-- Realistic backtest engine (Zipline, backtrader) — only an illustrative
-  equity curve with a flat 10 bps transaction cost
-- Multi-asset extension (ETH, SOL, ...)
-
-These constitute natural directions for follow-up research and are listed
-in the conclusions of the thesis.
 
 ## References
 
-Primary literature:
-
-- Jansen, S. (2020). *Machine Learning for Algorithmic Trading*, 2nd edition.
-  Packt Publishing.
-- López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley.
-- scikit-learn User Guide, *Probability calibration*:
-  https://scikit-learn.org/stable/modules/calibration.html
-- MLflow documentation: https://mlflow.org/docs/latest/
-
-## License
-
-Educational use only. This project was prepared as the practical part of an
-engineering thesis at Polish-Japanese Academy of Information Technology.
+- M. López de Prado, *Advances in Financial Machine Learning*, Wiley, 2018.
+- S. Jansen, *Machine Learning for Algorithmic Trading*, 2nd ed., Packt, 2020.
+- A. Niculescu-Mizil, R. Caruana, *Predicting Good Probabilities with Supervised Learning*, ICML 2005.

@@ -3,6 +3,8 @@ Fetch daily OHLCV data for BTC/USDT from Binance API.
 Saves raw data to data/raw/btc_daily.parquet
 """
 
+from __future__ import annotations
+
 import pandas as pd
 from binance.client import Client
 from pathlib import Path
@@ -12,14 +14,17 @@ import time
 SYMBOL = "BTCUSDT"
 INTERVAL = Client.KLINE_INTERVAL_1DAY
 START_DATE = "1 Jan, 2019"
+# Frozen end date = the exact sample used in the thesis (2672 daily bars).
+# Leave it fixed so every number in the README stays reproducible.
+END_DATE = "25 Apr, 2026"
 OUTPUT_PATH = Path("data/raw/btc_daily.parquet")
 
-def fetch_ohlcv(symbol: str, interval: str, start: str) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, interval: str, start: str, end: str | None = None) -> pd.DataFrame:
     """Fetch klines from Binance and return as DataFrame."""
     client = Client()  # no API key needed for public data
     
-    print(f"Fetching {symbol} {interval} from {start}...")
-    klines = client.get_historical_klines(symbol, interval, start)
+    print(f"Fetching {symbol} {interval} from {start} to {end or 'now'}...")
+    klines = client.get_historical_klines(symbol, interval, start, end)
     
     df = pd.DataFrame(klines, columns=[
         "open_time", "open", "high", "low", "close", "volume",
@@ -43,7 +48,7 @@ def fetch_ohlcv(symbol: str, interval: str, start: str) -> pd.DataFrame:
 if __name__ == "__main__":
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     
-    df = fetch_ohlcv(SYMBOL, INTERVAL, START_DATE)
+    df = fetch_ohlcv(SYMBOL, INTERVAL, START_DATE, END_DATE)
     
     print(f"Downloaded {len(df)} rows")
     print(df.tail(3))
